@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Shared production command path. Included inside the root transport namespace.
 // The host harness replaces only MMIO, DMA synchronization, clock and lock primitives.
+static bool hostReadOnlyDiscovery = false;
+
 struct HardwareTransferPort {
   uint64_t deadline;
   uint32_t doorbell () { return read32 (gHost.hc, 0x58); }
@@ -33,6 +35,9 @@ static uint32_t loadBe32 (const uint8_t *at)
 static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t timeoutUs, uint32_t *ocs)
 {
   *ocs = 15;
+  if (hostReadOnlyDiscovery && direction == 1) {
+    return kIOReturnNotPermitted;
+  }
   if (!timeoutUs || dataBytes > kDataMax || (dataBytes & 3) ||
       (dataBytes ? (direction != 1 && direction != 2) : direction != 0)) return kIOReturnBadArgument;
   if (gHost.poisoned) return kIOReturnNotReady;
@@ -166,6 +171,14 @@ static IOReturn hostScsiDir (uint8_t lun, const uint8_t *cdb, unsigned cdbLength
   *scsiStatus = 0xffff;
   if (!cdb || !cdbLength || cdbLength > 16 || dataBytes > kDataMax || direction > 2 ||
       (dataBytes & 3) || (dataBytes ? !direction : direction)) return kIOReturnBadArgument;
+  if (hostReadOnlyDiscovery) {
+    bool readCommand = cdb[0] == 0x00 || cdb[0] == 0x12 || cdb[0] == 0x25 || cdb[0] == 0x28;
+    bool wakeCommand = lun == 0xd0 && cdbLength == 6 && cdb[0] == 0x1b &&
+      cdb[1] == 0 && cdb[2] == 0 && cdb[3] == 0 && cdb[4] == 0x10 && cdb[5] == 0;
+    if (direction == 1 || (!readCommand && !wakeCommand)) {
+      return kIOReturnNotPermitted;
+    }
+  }
   if (!hostClearUcd ()) return kIOReturnNotReady;
   uint8_t *ucd = gHost.virt + kUcdOffset;
   ucd[0] = 0x01;                      // COMMAND UPIU

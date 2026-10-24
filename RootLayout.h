@@ -55,8 +55,11 @@ static bool rootEntryUsed (const uint8_t *entry)
 }
 
 // Find the partition named "userdata" in LUN 0's primary GPT (4096-byte sectors), then read the
-// manifest at its first block. Read-only. Returns false only if the GPT itself is unusable.
-static bool findRootLayout (RootLayout *layout, const char **why)
+// manifest at its first block. A nonzero deviceBlocks bounds the GPT by READ CAPACITY.
+// Discovery passes readManifest=false to stop after GPT entries without reading partition contents.
+// Returns false when the GPT or a required read cannot supply the root layout.
+static bool findRootLayout (RootLayout *layout, const char **why, uint64_t deviceBlocks = 0,
+                            bool readManifest = true)
 {
   gRootDiagnostic.stage = "GPT header";
   bzero (layout, sizeof (*layout));
@@ -90,7 +93,7 @@ static bool findRootLayout (RootLayout *layout, const char **why)
   uint32_t blocks = (count * 128 + 4095) / 4096;
   // This path uses READ(10), so reject geometry beyond its actual LBA range.
   if (first < entriesLba + blocks || last < first || backup <= last || backup > UINT32_MAX ||
-      backup - last <= blocks) {
+      backup - last <= blocks || (deviceBlocks && backup >= deviceBlocks)) {
     *why = "GPT usable range";
     return false;
   }
@@ -143,6 +146,10 @@ static bool findRootLayout (RootLayout *layout, const char **why)
   }
   gRootDiagnostic.first = layout->userdataFirst;
   gRootDiagnostic.last = layout->userdataLast;
+  if (!readManifest) {
+    gRootDiagnostic.stage = "GPT discovery complete";
+    return true;
+  }
   gRootDiagnostic.stage = "root manifest";
   // First block of the partition: manifest if the root image was flashed, ext4 otherwise.
   if (hostRead4k (0, layout->userdataFirst, 1, gScratch) != kIOReturnSuccess) {
