@@ -4,6 +4,8 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOPlatformExpert.h>
+#include <IOKit/pwr_mgt/IOPM.h>
+#include <IOKit/pwr_mgt/IOPMpowerState.h>
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
 #include <IOKit/storage/IOBlockStorageDevice.h>
 #endif
@@ -24,7 +26,12 @@ extern const uint8_t verified_root_key[];
 #include <libkern/c++/OSIterator.h>
 #include <IOKit/IOBSD.h>
 #include <kern/thread.h>
+#include <kern/sched_prim.h>
+#include <vm/pmap.h>
+#include <vm/memory_types.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOLocks.h>
+#include <machine/machine_routines.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
@@ -42,10 +49,14 @@ extern const uint8_t verified_root_key[];
 static UfsRootDiagnostics gRootDiagnostic;
 static UfsHardware gHardware = kSm8550Ufs;
 static bool gRootDiagnosticEnabled;
+static uint32_t gUfsInterrupt;
 static void rootDiagnosticFailure (const char *reason);
 
 extern "C" {
 #include <kern/boot_progress.h>
+// The kernel pmap attribute interfaces are absent from the IOKit KPI headers.
+extern unsigned int pmap_cache_attributes (ppnum_t);
+extern void pmap_set_cache_attributes (ppnum_t, unsigned int);
 volatile uint32_t native_ufs_probe_calls = 0;
 volatile uint32_t native_ufs_matched = 0;
 volatile uint32_t native_ufs_probe_requested = 0;
@@ -67,6 +78,8 @@ class NativeUfs : public IOService {
   OSDeclareDefaultStructors (NativeUfs)
   OSSharedPtr<IOMemoryMap> fMap;
   OSSharedPtr<IOBufferMemoryDescriptor> fCmdDesc;
+  bool fPowerManaged = false;
+  void startPowerManagement (IOService *provider);
   void inspect (void);
   void adoptAndRead (unsigned level);
   void dumpFirmwareList (void);
@@ -78,6 +91,8 @@ public:
   IOService *probe (IOService *provider, SInt32 *score) override;
   bool start (IOService *provider) override;
   void stop (IOService *provider) override;
+  IOReturn setPowerState (unsigned long ordinal, IOService *device) override;
+  void systemWillShutdown (IOOptionBits specifier) override;
 };
 
 OSDefineMetaClassAndStructors (NativeUfs, IOService)
@@ -161,6 +176,7 @@ static bool selectHardware (void)
   uint64_t controller[2] = {};
   uint64_t smmu[2] = {};
   uint32_t stream = 0;
+  readHardwareProperty (ufs, "native-ufs-interrupt", &gUfsInterrupt, sizeof (gUfsInterrupt));
   bool valid = soc && readHardwareProperty (soc, "ranges", bus, sizeof (bus)) &&
     readHardwareProperty (ufs, "reg", controller, sizeof (controller)) &&
     readHardwareProperty (ufs, "native-ufs-smmu-reg", smmu, sizeof (smmu)) &&
@@ -865,12 +881,9 @@ void NativeUfs::inspectContextBanks (void)
 // ======================================================================================
 // Root media: the live controller as a read-only block device.
 //
-// One shared host (a single UTP request slot, polled; interrupts stay masked) serves every
-// block device. The DMA region is ordinary cached, physically contiguous kernel memory with
-// explicit cache maintenance around each command (the stream is mapped through the reserved
-// apps_smmu bypass context bank by smmuBypassStream, so physical addresses are used as-is).
-// Nothing here writes to the storage: only INQUIRY-class and READ(10) commands are built, plus
-// the single START STOP UNIT that wakes the device from the power-down the firmware left.
+// The host uses slot zero during device initialization, then installs a bounded
+// request list with independent command and data buffers. Root windows are read
+// only; Data and log writes are restricted by the opened userdata windows.
 // ======================================================================================
 namespace {
 #include "RootTransportLayout.h"
@@ -947,7 +960,10 @@ static void hostWrite (unsigned offset, uint32_t value)
 
 #include "RootQueue.h"
 
+#include "RuntimeQueue.h"
+
 #include "RootCommands.h"
+#include "PowerLifecycle.h"
 
 // Bring the live controller up for reading: map, SMMU pass-through for the UFS stream, take over
 // the request list, wake the device from UFS-PowerDown and wait for LUN 0 to be ready.
@@ -1133,6 +1149,10 @@ static bool hostBringUp (const char **why)
       gHost.rootBlocks = uint64_t (lastBlock) + 1;
       IOLog ("NativeUfs: LUN 0 blocks=%llu block-bytes=%u\n", gHost.rootBlocks, blockBytes);
       gHost.ready = true;
+      if (!runtimeQueueStart (why)) {
+        gHost.ready = false;
+        return false;
+      }
       return true;
     }
     if (gHost.poisoned) break;
@@ -1353,6 +1373,13 @@ extern "C" int native_ufs_log_sync (void)
 // Busy storage is skipped; a submitted FUA command has a 100 ms deadline.
 extern "C" int native_ufs_log_panic_write (const void *src)
 {
+  if (gQueue.installed) {
+    if (!src || !gLogRegionBlocks || hostReadOnlyDiscovery) {
+      return 0;
+    }
+    uint64_t lba = gLogRegionFirst + gLogRegionBlocks - 1;
+    return hostInWindow (lba, 1) && runtimePanicWrite (lba, src) ? 1 : 0;
+  }
   if (!src || !gLogRegionBlocks || !gHost.ready || gHost.poisoned || !gHost.lock ||
       !IOLockTryLock (gHost.lock)) {
     return 0;
@@ -1396,6 +1423,8 @@ class NativeUfsBlock : public IOBlockStorageDevice {
   uint64_t bytes = 0;
   char label[32] = {};
   uint8_t *bounce = nullptr;
+  static constexpr unsigned kReadBuffers = 8;
+  uint32_t busyBuffers = 0;
   IOLock *windowLock = nullptr;
   bool online = false;
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
@@ -1463,6 +1492,10 @@ static void rootDiagnosticFailure (const char *reason)
   // Kept even when the panic diagnostic is off, so the boot page can say why nothing was published.
   native_ufs_root_failure = reason;
   if (!gRootDiagnosticEnabled) return;
+  if (gQueue.installed) {
+    runtimeFormatFailure (gRootDiagnosticText, sizeof (gRootDiagnosticText), reason, gRootDiagnostic.result);
+    panic ("%s", gRootDiagnosticText);
+  }
   gRootDiagnostic.published = native_ufs_blocks_published;
   gRootDiagnostic.reads = native_ufs_block_reads;
   gRootDiagnostic.failures = native_ufs_block_failures;
@@ -1482,7 +1515,7 @@ bool NativeUfsBlock::configure (const char *name, uint64_t absoluteOffset, uint6
   bytes = size;
   windowLock = IOLockAlloc ();
   if (!windowLock) return false;
-  bounce = static_cast<uint8_t *> (IOMalloc (kDataMax));
+  bounce = static_cast<uint8_t *> (IOMalloc (kDataMax * kReadBuffers));
   if (!bounce) {
     return false;
   }
@@ -1659,14 +1692,31 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
   if (!online) {
     return kIOReturnNotReady;
   }
+  unsigned bufferIndex = 0;
+  IOLockLock (windowLock);
+  for (;;) {
+    for (bufferIndex = 0; bufferIndex < kReadBuffers; bufferIndex++) {
+      if (!(busyBuffers & (1U << bufferIndex))) {
+        break;
+      }
+    }
+    if (bufferIndex < kReadBuffers) {
+      busyBuffers |= 1U << bufferIndex;
+      break;
+    }
+    IOLockSleep (windowLock, &busyBuffers, THREAD_UNINT);
+  }
+  IOLockUnlock (windowLock);
+
   struct Operations {
-    IOLock *mutex;
     IOMemoryDescriptor *buffer;
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
     const vr_view *view;
 #endif
-    void lock () { IOLockLock (mutex); }
-    void unlock () { IOLockUnlock (mutex); }
+    void lock () {
+    }
+    void unlock () {
+    }
     IOReturn read (uint64_t lba, uint32_t blocks, void *out) {
       uint64_t t0 = timerTicks ();
       IOReturn r = hostRead4k (0, lba, blocks, out);
@@ -1696,12 +1746,18 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
       if (copied == length) __atomic_fetch_add (&native_ufs_block_reads, 1, __ATOMIC_RELAXED);
       return copied;
     }
-  } operations = { windowLock, buffer
+  } operations = { buffer
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
     , &verified
 #endif
   };
-  UfsWindowResult outcome = ufsReadWindow (operations, absolute, bytes, block, count, bounce);
+  // Each reader retains its own snapshot through verification and copying.
+  UfsWindowResult outcome = ufsReadWindow (operations, absolute, bytes, block, count,
+    bounce + bufferIndex * kDataMax);
+  IOLockLock (windowLock);
+  busyBuffers &= ~(1U << bufferIndex);
+  IOLockWakeup (windowLock, &busyBuffers, false);
+  IOLockUnlock (windowLock);
   IOReturn result = outcome.status;
   uint64_t done = outcome.done;
   if (result != kIOReturnSuccess) {
@@ -1722,7 +1778,7 @@ void NativeUfsBlock::free ()
   }
 #endif
   if (bounce) {
-    IOFree (bounce, kDataMax);
+    IOFree (bounce, kDataMax * kReadBuffers);
     bounce = nullptr;
   }
   if (windowLock) {
@@ -2007,7 +2063,11 @@ bool NativeUfs::start (IOService *provider)
     }
     IOLog ("NativeUfs: discovery complete LUN=0 blocks=%llu block-bytes=4096 GPT entries=%u at=%llu userdata=%llu..%llu\n",
       gHost.rootBlocks, layout.gptEntryCount, layout.gptEntriesLba, layout.userdataFirst, layout.userdataLast);
-    return IOService::start (provider);
+    if (!IOService::start (provider)) {
+      return false;
+    }
+    startPowerManagement (provider);
+    return true;
   }
   if (probe == 2) {
     inspect ();
@@ -2242,12 +2302,67 @@ bool NativeUfs::startRoot (IOService *provider)
                           "root window preparation failed");
     return false;
   }
+  startPowerManagement (provider);
   return true;
 #endif
 }
 
+void NativeUfs::startPowerManagement (IOService *provider)
+{
+  if (!gQueue.installed) {
+    return;
+  }
+  static IOPMPowerState states[2] = {};
+  states[0].version = 1;
+  states[1].version = 1;
+  states[1].capabilityFlags = kIOPMDeviceUsable | kIOPMInitialDeviceState;
+  states[1].inputPowerRequirement = kIOPMPowerOn;
+  PMinit ();
+  fPowerManaged = initialized;
+  if (!fPowerManaged) {
+    IOLog ("NativeUfs: PM allocation failed\n");
+    return;
+  }
+  provider->joinPMtree (this);
+  IOReturn result = registerPowerDriver (this, states, 2);
+  if (result == kIOReturnSuccess) {
+    result = changePowerStateToPriv (1);
+  }
+  if (result != kIOReturnSuccess) {
+    PMstop ();
+    fPowerManaged = false;
+  }
+  IOLog ("NativeUfs: PM registration result=%x\n", result);
+}
+
+IOReturn NativeUfs::setPowerState (unsigned long ordinal, IOService *device)
+{
+  if (!fPowerManaged || device != this || ordinal > 1) {
+    return kIOPMAckImplied;
+  }
+  int completed = ordinal ? native_ufs_resume () : native_ufs_suspend ();
+  setProperty ("NativeUfsPowerTransitionComplete", completed != 0);
+  // IOKit has no rejection result for an already dispatched power transition.
+  // The request is finished here; an unsuccessful UIC transition quarantines DMA.
+  return kIOPMAckImplied;
+}
+
+void NativeUfs::systemWillShutdown (IOOptionBits specifier)
+{
+  int completed = native_ufs_shutdown ();
+  setProperty ("NativeUfsShutdownComplete", completed != 0);
+  IOService::systemWillShutdown (specifier);
+}
+
 void NativeUfs::stop (IOService *provider)
 {
+  if (fPowerManaged) {
+    PMstop ();
+    fPowerManaged = false;
+  }
+  if (gQueue.installed) {
+    native_ufs_shutdown ();
+  }
   fCmdDesc.reset ();
   fMap.reset ();
   IOService::stop (provider);

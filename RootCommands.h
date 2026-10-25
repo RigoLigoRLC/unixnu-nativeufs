@@ -256,10 +256,13 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
   if (!gHost.ready || !dst || !blocks || blocks > kDataMax / 4096 || lba > 0xffffffffULL - (blocks - 1)) {
     return kIOReturnBadArgument;
   }
-  IOLockLock (gHost.lock);
-  gRootDiagnostic.lba = lba;
   uint8_t cdb[10] = { 0x28, 0, uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
                       0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };
+  if (gQueue.installed) {
+    return runtimeCommand (lun, cdb, 2, blocks * 4096U, dst, 1000000);
+  }
+  IOLockLock (gHost.lock);
+  gRootDiagnostic.lba = lba;
   uint32_t scsi = 0;
   IOReturn status = hostScsi (lun, cdb, 10, true, blocks * 4096U, 1000000, &scsi);
   if (status == kIOReturnSuccess) {
@@ -305,14 +308,18 @@ static bool hostStoreOpen (uint64_t first, uint64_t blocks)
 // WRITE(10) of `blocks` 4096-byte blocks from src to lba on LUN 0; the range must lie inside one open window.
 static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool fua = false)
 {
-  if (!gHost.ready || !src || !blocks || blocks > kDataMax / 4096 || lun != 0 || !hostInWindow (lba, blocks)) {
+  if (!gHost.ready || hostReadOnlyDiscovery || !src || !blocks || blocks > kDataMax / 4096 ||
+      lun != 0 || !hostInWindow (lba, blocks)) {
     return kIOReturnBadArgument;
+  }
+  uint8_t cdb[10] = { 0x2a, uint8_t (fua ? 0x08 : 0), uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
+                      0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };
+  if (gQueue.installed) {
+    return runtimeCommand (0, cdb, 1, blocks * 4096U, const_cast<void *> (src), 2000000);
   }
   IOLockLock (gHost.lock);
   gRootDiagnostic.lba = lba;
   memcpy (gHost.virt + kDataOffset, src, blocks * 4096U);
-  uint8_t cdb[10] = { 0x2a, uint8_t (fua ? 0x08 : 0), uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
-                      0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };
   uint32_t scsi = 0;
   IOReturn status = hostScsiDir (0, cdb, 10, 1, blocks * 4096U, 2000000, &scsi);
   IOLockUnlock (gHost.lock);
@@ -323,8 +330,11 @@ static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const v
 static IOReturn hostSyncCache (void)
 {
   if (!gHost.ready || (!gStoreOpen && !gLogOpen)) return kIOReturnNotReady;
-  IOLockLock (gHost.lock);
   uint8_t cdb[10] = { 0x35 };
+  if (gQueue.installed) {
+    return runtimeCommand (0, cdb, 0, 0, nullptr, 10000000, true);
+  }
+  IOLockLock (gHost.lock);
   uint32_t scsi = 0;
   IOReturn status = hostScsiDir (0, cdb, 10, 0, 0, 10000000, &scsi);
   IOLockUnlock (gHost.lock);
