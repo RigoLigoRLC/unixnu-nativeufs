@@ -18,6 +18,19 @@ enum class UfsPowerState : uint32_t {
 };
 
 static IOReturn runtimeEnsureActive ();
+extern "C" void native_zone_dump_expanders (unsigned) __attribute__((weak_import));
+
+enum class UfsRequestPhase : uint32_t {
+  Free,
+  PreparingCommand,
+  CopyingWriteData,
+  PreparingDmaCache,
+  ReadyToSubmit,
+  WaitingCompletion,
+  ReadingDmaResponse,
+  CopyingReadData,
+  Releasing
+};
 
 // UfsRequest owns one command, response and data area until its caller finishes
 // copying the completed response. Failed hardware ownership keeps the whole
@@ -33,7 +46,43 @@ struct UfsRequest {
   uint32_t bytes = 0;
   unsigned direction = 0;
   bool aborting = false;
+  uint64_t owner = 0;
+  uint64_t leasedAt = 0;
+  uint32_t opcode = 0;
+  uint32_t lun = 0;
+  // The owner advances this scalar outside the queue lock during buffer copies.
+  uint32_t phase = static_cast<uint32_t> (UfsRequestPhase::Free);
 };
+
+static void runtimeSetPhase (UfsRequest &request, UfsRequestPhase phase)
+{
+  __atomic_store_n (&request.phase, static_cast<uint32_t> (phase), __ATOMIC_RELAXED);
+}
+
+static const char *runtimePhaseName (uint32_t phase)
+{
+  switch (static_cast<UfsRequestPhase> (phase)) {
+    case UfsRequestPhase::Free:
+      return "free";
+    case UfsRequestPhase::PreparingCommand:
+      return "prepare-command";
+    case UfsRequestPhase::CopyingWriteData:
+      return "copy-write-data";
+    case UfsRequestPhase::PreparingDmaCache:
+      return "prepare-dma-cache";
+    case UfsRequestPhase::ReadyToSubmit:
+      return "ready-submit";
+    case UfsRequestPhase::WaitingCompletion:
+      return "wait-completion";
+    case UfsRequestPhase::ReadingDmaResponse:
+      return "read-dma-response";
+    case UfsRequestPhase::CopyingReadData:
+      return "copy-read-data";
+    case UfsRequestPhase::Releasing:
+      return "release";
+  }
+  return "unknown";
+}
 
 // UfsRuntimeQueue separates the noncached UTRL from cached per-slot DMA.
 // The spin lock covers admission, descriptors and completion state. Callers
@@ -383,9 +432,11 @@ static uint64_t runtimeCommandLba (const uint8_t *cdb)
 }
 
 static int runtimeAcquire (bool barrier, uint64_t deadline, bool powerCommand,
-                           UfsAdmissionFailure *failure)
+                           UfsAdmissionFailure *failure, uint8_t lun, const uint8_t *cdb,
+                           unsigned direction, uint32_t bytes)
 {
   uint64_t began = mach_absolute_time ();
+  const uint64_t owner = thread_tid (current_thread ());
   bool ownsBarrier = false;
   for (;;) {
     IOInterruptState state = IOSimpleLockLockDisableInterrupt (gQueue.lock);
@@ -413,7 +464,15 @@ static int runtimeAcquire (bool barrier, uint64_t deadline, bool powerCommand,
           request.aborting = false;
           request.ocs = 15;
           request.result = kIOReturnNotReady;
-          gQueue.queueTicks += mach_absolute_time () - began;
+          request.owner = owner;
+          request.opcode = cdb[0];
+          request.lun = lun;
+          request.direction = direction;
+          request.bytes = bytes;
+          request.submittedAt = 0;
+          runtimeSetPhase (request, UfsRequestPhase::PreparingCommand);
+          request.leasedAt = mach_absolute_time ();
+          gQueue.queueTicks += request.leasedAt - began;
           IOSimpleLockUnlockEnableInterrupt (gQueue.lock, state);
           return static_cast<int> (index);
         }
@@ -464,6 +523,7 @@ static void runtimePrepare (unsigned index, uint8_t lun, const uint8_t *cdb, uns
   }
   memcpy (command + 16, cdb, 10);
   if (direction == 1) {
+    runtimeSetPhase (request, UfsRequestPhase::CopyingWriteData);
     memcpy (command + 4096, source, bytes);
   }
   uint32_t *prd = reinterpret_cast<uint32_t *> (command + kPrdtOffset);
@@ -471,7 +531,9 @@ static void runtimePrepare (unsigned index, uint8_t lun, const uint8_t *cdb, uns
   prd[1] = uint32_t ((request.physical + 4096) >> 32);
   prd[2] = 0;
   prd[3] = bytes ? bytes - 1 : 0;
+  runtimeSetPhase (request, UfsRequestPhase::PreparingDmaCache);
   cacheCivac (command, 4096 + bytes);
+  runtimeSetPhase (request, UfsRequestPhase::ReadyToSubmit);
 }
 
 static void runtimeSubmitLocked (unsigned index, unsigned direction, uint32_t bytes)
@@ -511,6 +573,7 @@ static IOReturn runtimeResponse (unsigned index, uint8_t lun, unsigned direction
   if (request.result != kIOReturnSuccess) {
     return request.result;
   }
+  runtimeSetPhase (request, UfsRequestPhase::ReadingDmaResponse);
   cacheInvalidate (request.command, 4096 + bytes);
   const uint8_t *response = request.command + kRspOffset;
   unsigned length = (unsigned (response[10]) << 8) | response[11];
@@ -530,6 +593,7 @@ static IOReturn runtimeResponse (unsigned index, uint8_t lun, unsigned direction
     return kIOReturnUnderrun;
   }
   if (direction == 2) {
+    runtimeSetPhase (request, UfsRequestPhase::CopyingReadData);
     memcpy (destination, request.command + 4096, bytes - (shortRead ? residual : 0));
   }
   return kIOReturnSuccess;
@@ -717,7 +781,8 @@ static IOReturn runtimeCommand (uint8_t lun, const uint8_t *cdb, unsigned direct
     // Admission can wait behind a ten-second flush or task recovery. The
     // command's hardware timeout starts only when its doorbell is submitted.
     clock_interval_to_deadline (30, kSecondScale, &deadline);
-    acquired = runtimeAcquire (barrier, deadline, powerCommand, &admission);
+    acquired = runtimeAcquire (barrier, deadline, powerCommand, &admission,
+      lun, cdb, direction, bytes);
   } while (acquired == -2);
   if (acquired < 0) {
     IOReturn result = admission.offline ? kIOReturnNotReady : kIOReturnTimeout;
@@ -751,6 +816,7 @@ static IOReturn runtimeCommand (uint8_t lun, const uint8_t *cdb, unsigned direct
   } else if (!gQueue.offline) {
     runtimeSubmitLocked (index, direction, bytes);
   }
+  runtimeSetPhase (request, UfsRequestPhase::WaitingCompletion);
   clock_interval_to_deadline (timeoutUs, kMicrosecondScale, &deadline);
   IOSimpleLockUnlockEnableInterrupt (gQueue.lock, state);
   for (;;) {
@@ -790,6 +856,7 @@ static IOReturn runtimeCommand (uint8_t lun, const uint8_t *cdb, unsigned direct
     runtimeWaitLocked (&request, deadline, state);
   }
   IOReturn result = runtimeResponse (index, lun, direction, bytes, data, allowShortRead);
+  runtimeSetPhase (request, UfsRequestPhase::Releasing);
   state = IOSimpleLockLockDisableInterrupt (gQueue.lock);
   if (result != kIOReturnSuccess) {
     gRuntimeFailure.phase = "command";
@@ -811,6 +878,7 @@ static IOReturn runtimeCommand (uint8_t lun, const uint8_t *cdb, unsigned direct
   }
   uint32_t ocs = request.ocs;
   gQueue.leased &= ~(1U << index);
+  runtimeSetPhase (request, UfsRequestPhase::Free);
   if (barrier) {
     gQueue.barrier = false;
   }
@@ -898,6 +966,12 @@ static bool runtimePanicWrite (uint64_t lba, const void *source)
 
 // UfsQueueSnapshot contains counters copied under the queue lock. Printing and
 // tick conversion occur after unlocking, in the USB command worker's context.
+struct UfsRequestSnapshot {
+  uint64_t owner, leasedAt, submittedAt, waitEvent;
+  uint32_t index, phase, opcode, lun, direction, bytes, result, ocs;
+  bool submitted, complete;
+};
+
 struct UfsQueueSnapshot {
   uint64_t submitted, completed, failed, admissionTimeouts;
   uint64_t queueTicks, hardwareTicks, readBytes, writeBytes, interrupts;
@@ -906,6 +980,7 @@ struct UfsQueueSnapshot {
   uint32_t gear[9], gearValid, hardware[5], clocks[15], power;
   bool clocksValid;
   bool offline, barrier, irq, recovering, writeError;
+  UfsRequestSnapshot requests[kRuntimeSlots];
 };
 
 extern "C" void native_ufs_dump_stats (void)
@@ -915,7 +990,16 @@ extern "C" void native_ufs_dump_stats (void)
     return;
   }
   UfsQueueSnapshot snapshot = {};
-  IOInterruptState state = IOSimpleLockLockDisableInterrupt (gQueue.lock);
+  IOInterruptState state = ml_set_interrupts_enabled (false);
+  if (!IOSimpleLockTryLock (gQueue.lock)) {
+    ml_set_interrupts_enabled (state);
+    IOLog ("NativeUfs: snapshot queue-lock-busy\n");
+    if (native_zone_dump_expanders) {
+      native_zone_dump_expanders (50);
+    }
+    return;
+  }
+  const uint64_t now = mach_absolute_time ();
   snapshot.submitted = gQueue.submitted;
   snapshot.completed = gQueue.completed;
   snapshot.failed = gQueue.failed;
@@ -953,9 +1037,28 @@ extern "C" void native_ufs_dump_stats (void)
   for (unsigned index = 0; index < 15; index++) {
     snapshot.clocks[index] = gQueue.clocks[index];
   }
+  unsigned requestCount = 0;
   for (unsigned index = 0; index < gQueue.count; index++) {
-    if ((gQueue.leased & (1U << index)) && gQueue.requests[index].submitted &&
-        !gQueue.requests[index].complete) {
+    if (!(gQueue.leased & (1U << index))) {
+      continue;
+    }
+    const UfsRequest &request = gQueue.requests[index];
+    UfsRequestSnapshot &copy = snapshot.requests[requestCount++];
+    copy.owner = request.owner;
+    copy.leasedAt = request.leasedAt;
+    copy.submittedAt = request.submittedAt;
+    copy.waitEvent = reinterpret_cast<uintptr_t> (&request);
+    copy.index = index;
+    copy.phase = __atomic_load_n (&request.phase, __ATOMIC_RELAXED);
+    copy.opcode = request.opcode;
+    copy.lun = request.lun;
+    copy.direction = request.direction;
+    copy.bytes = request.bytes;
+    copy.result = static_cast<uint32_t> (request.result);
+    copy.ocs = request.ocs;
+    copy.submitted = request.submitted;
+    copy.complete = request.complete;
+    if (request.submitted && !request.complete) {
       snapshot.active++;
     }
   }
@@ -983,6 +1086,23 @@ extern "C" void native_ufs_dump_stats (void)
          "SYS1CLK=%x SYMBOLCLK=%x CFG1=%x CFG2=%x\n", snapshot.power,
     snapshot.gear[6], snapshot.gear[7], snapshot.gear[8], snapshot.hardware[0],
     snapshot.hardware[1], snapshot.hardware[2], snapshot.hardware[3], snapshot.hardware[4]);
+  for (unsigned index = 0; index < requestCount; index++) {
+    const UfsRequestSnapshot &request = snapshot.requests[index];
+    uint64_t leaseNs = 0, submitNs = 0;
+    if (request.leasedAt && now >= request.leasedAt) {
+      absolutetime_to_nanoseconds (now - request.leasedAt, &leaseNs);
+    }
+    if (request.submitted && request.submittedAt && now >= request.submittedAt) {
+      absolutetime_to_nanoseconds (now - request.submittedAt, &submitNs);
+    }
+    IOLog ("NativeUfs: slot=%u owner=%llu phase=%s opcode=%x lun=%u dir=%u bytes=%u "
+           "submitted=%u complete=%u result=%x ocs=%x\n",
+      request.index, request.owner, runtimePhaseName (request.phase), request.opcode,
+      request.lun, request.direction, request.bytes, request.submitted ? 1U : 0U,
+      request.complete ? 1U : 0U, request.result, request.ocs);
+    IOLog ("NativeUfs: slot=%u lease-us=%llu submit-age-us=%llu wait-event=%llx\n",
+      request.index, leaseNs / 1000, submitNs / 1000, request.waitEvent);
+  }
   if (snapshot.clocksValid) {
     const char *names[] = { "axi", "unipro", "aux" };
     for (unsigned index = 0; index < 3; index++) {
@@ -990,5 +1110,8 @@ extern "C" void native_ufs_dump_stats (void)
       IOLog ("NativeUfs: saved RCG %s cmd=%x cfg=%x m=%x n=%x d=%x\n",
         names[index], values[0], values[1], values[2], values[3], values[4]);
     }
+  }
+  if (native_zone_dump_expanders) {
+    native_zone_dump_expanders (50);
   }
 }

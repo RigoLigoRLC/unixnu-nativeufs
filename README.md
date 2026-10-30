@@ -43,3 +43,12 @@ from the device when publishing root media.
 headers prepared by `scripts/prepare-storage-headers.py`.
 
 Linked into XNU by `unixnu build kernel`.
+
+The USB `ufs` command takes a bounded software snapshot with one queue-lock
+attempt. Occupied slots report the owning thread, opcode, direction, byte count,
+buffer-copy or completion phase, submitted/completed flags and lease age. The
+phase stores reuse the existing request lifetime; lease timing reuses admission
+accounting. Formatting runs after releasing the queue lock. An optional kernel
+diagnostic also reports allocation zones with expansion waiters and zone 50,
+including their expansion owners. These snapshots do not change admission or
+request retirement.
